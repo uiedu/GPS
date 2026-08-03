@@ -1,38 +1,8 @@
 #!/usr/bin/env python3
 """
 navigate_gui.py
-Generated using Claude AI (https://claude.ai) wit multiple prompts to create a complete Tkinter GUI for live field navigation with an RTK-capable GNSS receiver.
+
 Tkinter GUI for live field navigation with an RTK-capable GNSS receiver.
-
-
-Install PyGPSClient in Raspberry Pi OS / Debian / Ubuntu:
-https://pypi.org/project/pygpsclient/ 
-sudo apt update 
-sudo apt install -y python3-pip python3-venv python3-tk 
-python3 -m venv ~/pygpsclient 
-source ~/pygpsclient/bin/activate 
-python3 -m pip install --upgrade pip 
-python3 -m pip install pygpsclient
-
-Add the venv's bin to your PATH in ~/.bashrc if you want to launch it without activating each time:
-
-echo 'export PATH="$HOME/pygpsclient/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-
-Navigation Points
-Use a text file with the following format to define waypoints. Each line should contain a waypoint name, latitude, and longitude, separated by commas. Lines starting with '#' are treated as comments and ignored.
-
-# name, latitude, longitude
-Beacon1, 46.731100, -117.180500
-Beacon2, 46.731400, -117.180800
-Beacon3, 46.731050, -117.181200
-
-Lines starting with # are comments. Once you arrive within the threshold of one waypoint, it automatically advances to the next and tells you the new bearing/distance.
-
-Run:
-    python3 navigate_gui.py
-
-
 
 Features:
   - Connect to a serial GNSS receiver (with optional NTRIP RTK corrections
@@ -48,20 +18,8 @@ Requires: pynmeagps, pyserial, pygnssutils (all installed alongside
 pygpsclient), tkinter (usually bundled with Python; on Debian/Raspberry Pi
 OS install with: sudo apt install python3-tk)
 
-Free NTRIP Client for Moscow area
-Server: rtk2go.com
-Port: 2101
-Mountpoint: FN-PAL
-User: your email 
-Password: none or leave blank
-
-To set up GPS-Client Go to https://www.ardusimple.com/how-to-configure-ublox-zed-f9p/#update-firmware
-
-
-
-Added navigate-gui.py a python scirpt for Raspberry pi to navigate to a point and also uses optional NTRIP
-
-
+Run:
+    python3 navigate_gui.py
 """
 
 import csv
@@ -97,6 +55,15 @@ FIX_QUALITY_COLORS = {
     0: "#c0392b", 1: "#e67e22", 2: "#e67e22",
     4: "#27ae60", 5: "#f1c40f", 6: "#8e44ad",
 }
+
+# Rough typical 1-sigma "user equivalent range error" per fix type, in
+# meters. Used only as a fallback to estimate 2D accuracy (accuracy_m ~=
+# HDOP * UERE) when the receiver doesn't emit a GST sentence. These are
+# ballpark figures, not a substitute for a real measured accuracy.
+FIX_QUALITY_UERE_M = {
+    0: 10.0, 1: 5.0, 2: 2.5, 4: 0.02, 5: 0.4, 6: 5.0,
+}
+METERS_TO_INCHES = 39.3701
 
 
 # --------------------------------------------------------------------------
@@ -142,7 +109,19 @@ def local_enu(lat0, lon0, lat, lon):
     return east, north
 
 
+def waypoint_display_str(wp):
+    base = f"{wp['name']}  ({wp['lat']:.8f}, {wp['lon']:.8f}"
+    if wp.get("elev_ft") is not None:
+        base += f", {wp['elev_ft']:.1f} ft"
+    return base + ")"
+
+
 def load_waypoints(filepath):
+    """Load waypoints from a 'name,lat,lon[,elev_ft]' text/CSV file.
+
+    Elevation is an optional 4th column, kept purely for reference/display -
+    it is never used in distance/bearing navigation math.
+    """
     waypoints = []
     with open(filepath, "r", newline="") as f:
         reader = csv.reader(f)
@@ -157,7 +136,15 @@ def load_waypoints(filepath):
                 lat, lon = float(lat_s), float(lon_s)
             except ValueError:
                 continue
-            waypoints.append({"name": name, "lat": lat, "lon": lon})
+
+            elev_ft = None
+            if len(row) >= 4 and row[3]:
+                try:
+                    elev_ft = float(row[3])
+                except ValueError:
+                    elev_ft = None
+
+            waypoints.append({"name": name, "lat": lat, "lon": lon, "elev_ft": elev_ft})
     return waypoints
 
 
@@ -208,6 +195,20 @@ class SerialReaderThread(threading.Thread):
                 if parsed is None or not isinstance(parsed, NMEAMessage):
                     continue
                 msg_id = parsed.identity
+
+                if msg_id in ("GNGST", "GPGST"):
+                    std_lat = getattr(parsed, "stdLat", None)
+                    std_lon = getattr(parsed, "stdLon", None)
+                    try:
+                        if std_lat not in (None, "") and std_lon not in (None, ""):
+                            acc_2d_m = math.hypot(float(std_lat), float(std_lon))
+                            self.out_queue.put(
+                                {"accuracy_2d_m": acc_2d_m, "accuracy_source": "GST"}
+                            )
+                    except (TypeError, ValueError):
+                        pass
+                    continue
+
                 if msg_id not in ("GNGGA", "GPGGA", "GNRMC", "GPRMC"):
                     continue
 
@@ -219,6 +220,7 @@ class SerialReaderThread(threading.Thread):
                 quality = 0
                 hdop = None
                 numsv = None
+                alt = None
                 if msg_id.endswith("GGA"):
                     quality = getattr(parsed, "quality", 0) or 0
                     alt = getattr(parsed, "alt", None)
@@ -230,7 +232,10 @@ class SerialReaderThread(threading.Thread):
                     self.gnss_state.update(lat, lon)
 
                 self.out_queue.put(
-                    {"lat": lat, "lon": lon, "quality": quality, "hdop": hdop, "numsv": numsv}
+                    {
+                        "lat": lat, "lon": lon, "quality": quality,
+                        "hdop": hdop, "numsv": numsv, "alt": alt,
+                    }
                 )
         except Exception as e:
             raw_msg = str(e)
@@ -286,7 +291,15 @@ class NavigateApp(tk.Tk):
         self.current_quality = 0
         self.current_hdop = None
         self.current_numsv = None
+        self.current_alt_m = None
+        self.current_accuracy_m = None
+        self.last_gst_time = None
         self._arrived_index = None
+
+        self._overlay_target_text = ""
+        self._overlay_distance_text = ""
+        self._overlay_distance_color = "white"
+        self._overlay_bearing_text = ""
 
         self.waypoint_filepath = None
         self.last_rtcm_time = None
@@ -298,11 +311,11 @@ class NavigateApp(tk.Tk):
         self.baud_var = tk.StringVar(value="38400")
         self.ntrip_enabled = tk.BooleanVar(value=False)
         self.ntrip_vars = {
-            "server": tk.StringVar(value=""),
+            "server": tk.StringVar(value="trk2go.com"),
             "port": tk.StringVar(value="2101"),
-            "mountpoint": tk.StringVar(value=""),
-            "user": tk.StringVar(value="anon"),
-            "password": tk.StringVar(value="password"),
+            "mountpoint": tk.StringVar(value="IFN-PAL"),
+            "user": tk.StringVar(value="my@email.com"),
+            "password": tk.StringVar(value="none"),
         }
         self._setup_win = None
 
@@ -457,19 +470,6 @@ class NavigateApp(tk.Tk):
         self.dop_label = ttk.Label(right, text="HDOP: --    Sats: --")
         self.dop_label.pack(anchor="w")
 
-        self.target_label = ttk.Label(
-            right, text="No target loaded", font=("TkDefaultFont", 12)
-        )
-        self.target_label.pack(anchor="w")
-
-        self.distance_label = ttk.Label(
-            right, text="", font=("TkDefaultFont", 16, "bold")
-        )
-        self.distance_label.pack(anchor="w", pady=(4, 0))
-
-        self.bearing_label = ttk.Label(right, text="", font=("TkDefaultFont", 14))
-        self.bearing_label.pack(anchor="w")
-
         self.canvas = tk.Canvas(right, bg="#1a1a1a", width=600, height=420)
         self.canvas.pack(fill="both", expand=True, pady=6)
 
@@ -608,9 +608,7 @@ class NavigateApp(tk.Tk):
                 self.waypoints = wps
                 self.waypoint_filepath = wp_path
                 for wp in wps:
-                    self.wp_listbox.insert(
-                        tk.END, f"{wp['name']}  ({wp['lat']:.8f}, {wp['lon']:.8f})"
-                    )
+                    self.wp_listbox.insert(tk.END, waypoint_display_str(wp))
                 self.target_index = min(cfg.get("target_index", 0), len(wps) - 1)
                 self._highlight_target()
                 self._update_target_label()
@@ -787,7 +785,7 @@ class NavigateApp(tk.Tk):
         self.wp_listbox.delete(0, tk.END)
         for wp in wps:
             self.wp_listbox.insert(
-                tk.END, f"{wp['name']}  ({wp['lat']:.8f}, {wp['lon']:.8f})"
+                tk.END, waypoint_display_str(wp)
             )
         self._highlight_target()
         self._update_target_label()
@@ -810,11 +808,10 @@ class NavigateApp(tk.Tk):
     def _update_target_label(self):
         if self.waypoints:
             t = self.waypoints[self.target_index]
-            self.target_label.config(
-                text=f"Target: {t['name']}  ({t['lat']:.8f}, {t['lon']:.8f})"
-            )
+            self._overlay_target_text = f"Target: {waypoint_display_str(t)}"
         else:
-            self.target_label.config(text="No target loaded")
+            self._overlay_target_text = ""
+        self._draw_canvas()
 
     # ---- Save current location ----
 
@@ -839,9 +836,14 @@ class NavigateApp(tk.Tk):
             self.waypoint_filepath = filepath
             if not __import__("os").path.exists(filepath):
                 with open(filepath, "w") as f:
-                    f.write("# name, latitude, longitude\n")
+                    f.write("# name, latitude, longitude, elevation_ft (optional)\n")
 
-        line = f"{name}, {self.current_lat:.8f}, {self.current_lon:.8f}\n"
+        elev_ft = self.current_alt_m * 3.28084 if self.current_alt_m is not None else None
+        if elev_ft is not None:
+            line = f"{name}, {self.current_lat:.8f}, {self.current_lon:.8f}, {elev_ft:.1f}\n"
+        else:
+            line = f"{name}, {self.current_lat:.8f}, {self.current_lon:.8f}\n"
+
         try:
             with open(self.waypoint_filepath, "a") as f:
                 f.write(line)
@@ -849,11 +851,9 @@ class NavigateApp(tk.Tk):
             messagebox.showerror("Save error", str(e))
             return
 
-        wp = {"name": name, "lat": self.current_lat, "lon": self.current_lon}
+        wp = {"name": name, "lat": self.current_lat, "lon": self.current_lon, "elev_ft": elev_ft}
         self.waypoints.append(wp)
-        self.wp_listbox.insert(
-            tk.END, f"{wp['name']}  ({wp['lat']:.8f}, {wp['lon']:.8f})"
-        )
+        self.wp_listbox.insert(tk.END, waypoint_display_str(wp))
         if len(self.waypoints) == 1:
             # first waypoint ever added - make it the active target
             self.target_index = 0
@@ -861,7 +861,8 @@ class NavigateApp(tk.Tk):
             self._update_target_label()
 
         messagebox.showinfo("Saved", f"Saved '{name}' to {self.waypoint_filepath}")
-        self._log(f"Saved current location as '{name}' ({wp['lat']:.8f}, {wp['lon']:.8f})")
+        elev_log = f", {wp['elev_ft']:.1f} ft" if wp.get("elev_ft") is not None else ""
+        self._log(f"Saved current location as '{name}' ({wp['lat']:.8f}, {wp['lon']:.8f}{elev_log})")
 
     # ---- Queue polling / live update ----
 
@@ -881,6 +882,10 @@ class NavigateApp(tk.Tk):
                 if "ntrip_error" in item:
                     self.fix_label.config(text="NTRIP ERROR")
                     continue
+                if "accuracy_2d_m" in item:
+                    self.current_accuracy_m = item["accuracy_2d_m"]
+                    self.last_gst_time = time.time()
+                    continue
                 latest = item
         except queue.Empty:
             pass
@@ -899,6 +904,8 @@ class NavigateApp(tk.Tk):
                 self.current_hdop = latest["hdop"]
             if latest.get("numsv") is not None:
                 self.current_numsv = latest["numsv"]
+            if latest.get("alt") is not None:
+                self.current_alt_m = latest["alt"]
             self._update_display()
 
         self._update_ntrip_status()
@@ -929,15 +936,46 @@ class NavigateApp(tk.Tk):
         label = FIX_QUALITY_LABELS.get(q, str(q))
         color = FIX_QUALITY_COLORS.get(q, "#888888")
         self.fix_label.config(text=label, foreground=color)
+
+        if self.current_alt_m is not None:
+            elev_ft = self.current_alt_m * 3.28084
+            elev_str = f"   elev: {elev_ft:.1f} ft"
+        else:
+            elev_str = ""
         self.pos_label.config(
-            text=f"lat: {self.current_lat:.8f}   lon: {self.current_lon:.8f}"
+            text=f"lat: {self.current_lat:.8f}   lon: {self.current_lon:.8f}{elev_str}"
         )
 
         hdop_str = f"{self.current_hdop:.1f}" if self.current_hdop is not None else "--"
         sats_str = str(self.current_numsv) if self.current_numsv is not None else "--"
-        self.dop_label.config(text=f"HDOP: {hdop_str}    Sats: {sats_str}")
+
+        # 2D accuracy: prefer a real GST-derived value if one arrived
+        # recently, otherwise fall back to an HDOP-based estimate.
+        now = time.time()
+        if self.last_gst_time is not None and now - self.last_gst_time < 5 and self.current_accuracy_m is not None:
+            acc_m = self.current_accuracy_m
+            acc_suffix = ""
+        elif self.current_hdop is not None:
+            uere = FIX_QUALITY_UERE_M.get(self.current_quality, 5.0)
+            acc_m = self.current_hdop * uere
+            acc_suffix = " (est.)"
+        else:
+            acc_m = None
+            acc_suffix = ""
+
+        if acc_m is not None:
+            acc_in = acc_m * METERS_TO_INCHES
+            acc_str = f"{acc_in:.1f} in{acc_suffix}"
+        else:
+            acc_str = "--"
+
+        self.dop_label.config(
+            text=f"HDOP: {hdop_str}    Sats: {sats_str}    2D Acc: {acc_str}"
+        )
 
         if not self.waypoints or self.current_lat is None:
+            self._overlay_distance_text = ""
+            self._overlay_bearing_text = ""
             self._draw_canvas()
             return
 
@@ -955,19 +993,20 @@ class NavigateApp(tk.Tk):
             threshold = 3.0
 
         if distance_display <= threshold:
-            self.distance_label.config(text="ARRIVED", foreground="#27ae60")
-            self.bearing_label.config(text=f"at '{target['name']}'")
+            self._overlay_distance_text = "ARRIVED"
+            self._overlay_distance_color = "#27ae60"
+            self._overlay_bearing_text = f"at '{target['name']}'"
             was_new_arrival = self._arrived_index != self.target_index
             self._advance_waypoint()
             if was_new_arrival:
                 self._log(f"Arrived at waypoint '{target['name']}'")
         else:
             compass = bearing_to_compass(bearing_deg)
-            self.distance_label.config(
-                text=f"{distance_display:.1f} {units}", foreground="white"
-            )
-            self.bearing_label.config(
-                text=f"Bearing: {bearing_deg:.0f}\u00b0 ({compass})  to '{target['name']}'"
+            self._overlay_distance_text = f"{distance_display:.1f} {units}"
+            self._overlay_distance_color = "white"
+            self._overlay_bearing_text = (
+                #f"Bearing: {bearing_deg:.0f}\u00b0 ({compass})  to '{target['name']}'"
+                f"{bearing_deg:.0f}\u00b0 ({compass})"
             )
 
         self._draw_canvas()
@@ -985,12 +1024,43 @@ class NavigateApp(tk.Tk):
 
     # ---- Canvas drawing ----
 
+    def _text_height(self, c, item_id):
+        bbox = c.bbox(item_id)
+        return (bbox[3] - bbox[1]) if bbox else 16
+
+    def _draw_overlay_text(self, c, w):
+        pad = 12
+        y = pad
+        line_gap = 4
+
+        target_id = c.create_text(
+            pad, y, text=self._overlay_target_text, fill="#dddddd",
+            font=("TkDefaultFont", 10), anchor="nw", width=w - 2 * pad,
+        )
+        y += self._text_height(c, target_id) + line_gap
+
+        if self._overlay_distance_text:
+            dist_id = c.create_text(
+                pad, y, text=self._overlay_distance_text,
+                fill=self._overlay_distance_color,
+                font=("TkDefaultFont", 12, "bold"), anchor="nw",
+            )
+            y += self._text_height(c, dist_id) + line_gap
+
+        if self._overlay_bearing_text:
+            c.create_text(
+                pad, y, text=self._overlay_bearing_text, fill="#cccccc",
+                font=("TkDefaultFont", 12), anchor="nw", width=w - 2 * pad,
+            )
+
     def _draw_canvas(self):
         c = self.canvas
         c.delete("all")
         w = c.winfo_width() or 600
         h = c.winfo_height() or 420
         cx, cy = w / 2, h / 2
+
+        self._draw_overlay_text(c, w)
 
         if self.current_lat is None:
             c.create_text(
