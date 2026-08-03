@@ -1,8 +1,38 @@
 #!/usr/bin/env python3
 """
 navigate_gui.py
-
+Generated using Claude AI (https://claude.ai) wit multiple prompts to create a complete Tkinter GUI for live field navigation with an RTK-capable GNSS receiver.
 Tkinter GUI for live field navigation with an RTK-capable GNSS receiver.
+
+
+Install PyGPSClient in Raspberry Pi OS / Debian / Ubuntu:
+https://pypi.org/project/pygpsclient/ 
+sudo apt update 
+sudo apt install -y python3-pip python3-venv python3-tk 
+python3 -m venv ~/pygpsclient 
+source ~/pygpsclient/bin/activate 
+python3 -m pip install --upgrade pip 
+python3 -m pip install pygpsclient
+
+Add the venv's bin to your PATH in ~/.bashrc if you want to launch it without activating each time:
+
+echo 'export PATH="$HOME/pygpsclient/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+
+Navigation Points
+Use a text file with the following format to define waypoints. Each line should contain a waypoint name, latitude, and longitude, separated by commas. Lines starting with '#' are treated as comments and ignored.
+
+# name, latitude, longitude
+Beacon1, 46.731100, -117.180500
+Beacon2, 46.731400, -117.180800
+Beacon3, 46.731050, -117.181200
+
+Lines starting with # are comments. Once you arrive within the threshold of one waypoint, it automatically advances to the next and tells you the new bearing/distance.
+
+Run:
+    python3 navigate_gui.py
+
+
 
 Features:
   - Connect to a serial GNSS receiver (with optional NTRIP RTK corrections
@@ -18,8 +48,20 @@ Requires: pynmeagps, pyserial, pygnssutils (all installed alongside
 pygpsclient), tkinter (usually bundled with Python; on Debian/Raspberry Pi
 OS install with: sudo apt install python3-tk)
 
-Run:
-    python3 navigate_gui.py
+Free NTRIP Client for Moscow area
+Server: rtk2go.com
+Port: 2101
+Mountpoint: FN-PAL
+User: your email 
+Password: none or leave blank
+
+To set up GPS-Client Go to https://www.ardusimple.com/how-to-configure-ublox-zed-f9p/#update-firmware
+
+
+
+Added navigate-gui.py a python scirpt for Raspberry pi to navigate to a point and also uses optional NTRIP
+
+
 """
 
 import csv
